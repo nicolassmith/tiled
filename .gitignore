@@ -57,6 +57,7 @@ target/
 #VSCode
 .vscode/*
 !.vscode/launch.json
+.devcontainer/devcontainer-lock.json
 
 #Ipython Notebook
 .ipynb_checkpoints
