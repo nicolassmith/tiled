@@ -5,6 +5,15 @@ Write the date in place of the "Unreleased" in the case a new version is release
 
 ## Unreleased
 
+### Added
+
+- `Container.search_recursive(query, max_depth=None)` and the corresponding
+  `GET /api/v1/search-recursive/{path}` HTTP endpoint, which search all
+  descendants of a node (at any depth), not just direct children. Results are
+  returned as a `RecursiveSearchResults` mapping keyed by path tuples relative
+  to the search root. Supported by both the SQL catalog and `MapAdapter`. See
+  [#1368](https://github.com/bluesky/tiled/issues/1368).
+
 ### Fixed
 
 - Reading of individual partitions of multi-partitioned tables.

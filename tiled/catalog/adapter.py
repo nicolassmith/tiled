@@ -308,6 +308,8 @@ class CatalogNodeAdapter:
         sorting: Optional[list[tuple[str, Literal[1, -1]]]] = None,
         mount_path: Optional[list[str]] = None,
         create_mount_nodes_if_not_exist: bool = False,
+        recursive: bool = False,
+        max_depth: Optional[int] = None,
     ):
         self.context = context
         self.node = node
@@ -318,6 +320,10 @@ class CatalogNodeAdapter:
         ) = construct_order_by_clauses(self.sorting)
         self.conditions = conditions or []
         self.queries = queries or []
+        # When True, listing/counting methods below scope to ALL descendants
+        # (via nodes_closure) rather than just direct children. See search_recursive().
+        self.recursive = recursive
+        self.max_depth = max_depth
         self.structure_family = node.structure_family
         self.specs = [Spec(**spec) for spec in node.specs]
         self.startup_tasks = [self.startup]
@@ -407,7 +413,7 @@ class CatalogNodeAdapter:
         return f"<{type(self).__name__} {self.key}>"
 
     async def __aiter__(self):
-        statement = select(orm.Node.key).filter(orm.Node.parent == self.node.id)
+        statement = self._scope_statement(select(orm.Node.key))
         for condition in self.conditions:
             statement = statement.filter(condition)
         async with self.context.session() as db:
@@ -495,12 +501,8 @@ class CatalogNodeAdapter:
         return statement
 
     async def exact_len(self):
-        "Get the exact number of child nodes."
-        statement = (
-            select(func.count())
-            .select_from(orm.Node)
-            .filter(orm.Node.parent == self.node.id)
-        )
+        "Get the exact number of child (or, if recursive, descendant) nodes."
+        statement = self._scope_statement(select(func.count()).select_from(orm.Node))
         statement = self.apply_conditions(statement)
 
         async with self.context.session() as db:
@@ -516,6 +518,10 @@ class CatalogNodeAdapter:
         If the database is not PostgreSQL, or if the statistics can not be
         obtained, return None.
         """
+        if self.recursive:
+            # pg_stats counts direct children by `parent`, which cannot
+            # approximate a recursive descendant count. Fall back to exact_len.
+            return None
 
         if self.context.engine.dialect.name == "postgresql":
             async with self.context.session() as db:
@@ -556,11 +562,8 @@ class CatalogNodeAdapter:
         containers. If result is <= `threshold`, it is exact.
         """
 
-        limited = (
-            select(literal(1))
-            .select_from(orm.Node)
-            .where(orm.Node.parent == self.node.id)
-            .limit(threshold + 1)
+        limited = self._scope_statement(select(literal(1)).select_from(orm.Node)).limit(
+            threshold + 1
         )
         limited = self.apply_conditions(limited).cte("limited")
         statement = select(func.count()).select_from(limited)
@@ -808,6 +811,8 @@ class CatalogNodeAdapter:
         sorting=UNCHANGED,
         conditions=UNCHANGED,
         queries=UNCHANGED,
+        recursive=UNCHANGED,
+        max_depth=UNCHANGED,
         **kwargs,
     ):
         if sorting is UNCHANGED:
@@ -816,12 +821,18 @@ class CatalogNodeAdapter:
             conditions = self.conditions
         if queries is UNCHANGED:
             queries = self.queries
+        if recursive is UNCHANGED:
+            recursive = self.recursive
+        if max_depth is UNCHANGED:
+            max_depth = self.max_depth
         return type(self)(
             self.context,
             node=self.node,
             conditions=conditions,
             sorting=sorting,
             queries=queries,
+            recursive=recursive,
+            max_depth=max_depth,
             **kwargs,
         )
 
@@ -832,6 +843,78 @@ class CatalogNodeAdapter:
             self.queries.append(query)
             return self
         return self.query_registry(query, self)
+
+    def search_recursive(self, max_depth=None):
+        """Return a variation of this node that searches ALL descendants.
+
+        Subsequent `.search(query)` calls (and the access-policy conditions
+        applied ahead of them) will match against nodes at any depth below
+        this one, not just direct children. See `_scope_statement`.
+
+        DECISION NEEDING REVIEW (see issue #1368): the access-policy condition
+        is evaluated only against each matched node itself, not against its
+        intermediate ancestors, so a match could be returned even if one of
+        its ancestor containers is not independently visible to the
+        principal. The stricter alternative -- requiring every ancestor on
+        the path to also satisfy the access policy -- is not implemented.
+        """
+        return self.new_variation(recursive=True, max_depth=max_depth)
+
+    def _scope_statement(self, statement):
+        """Restrict a `SELECT ... FROM nodes` statement to the nodes in scope.
+
+        By default (self.recursive is False), scope is this node's direct
+        children, via the adjacency-list `parent` column.
+
+        When self.recursive is True, scope is ALL descendants of this node
+        (any depth), found via the `nodes_closure` table, which is kept up
+        to date by DB triggers (see orm.py). `self.max_depth`, if set, bounds
+        how many levels below this node to include.
+        """
+        if not self.recursive:
+            return statement.filter(orm.Node.parent == self.node.id)
+        statement = statement.join(
+            orm.NodesClosure, orm.NodesClosure.descendant == orm.Node.id
+        ).where(orm.NodesClosure.ancestor == self.node.id, orm.NodesClosure.depth >= 1)
+        if self.max_depth is not None:
+            statement = statement.where(orm.NodesClosure.depth <= self.max_depth)
+        return statement
+
+    async def relative_keys_for_ids(self, ids):
+        """Map each of the given (descendant) node ids to a relative key.
+
+        The relative key is the "/"-joined chain of key segments from just
+        below this node (the recursive search root) down to, and including,
+        the node with the given id. Used only in recursive mode: results at
+        different depths may share a local `key`, so callers use this joined
+        string, rather than the bare `orm.Node.key`, as an unambiguous
+        identifier.
+        """
+        if not ids:
+            return {}
+        # For each id, walk its ancestor chain (via the self-row at depth=0
+        # up through its ancestors), restricted to nodes at-or-below this
+        # search root (i.e. excluding the root itself and anything above it).
+        statement = (
+            select(orm.NodesClosure.descendant, orm.Node.key, orm.NodesClosure.depth)
+            .join(orm.Node, orm.Node.id == orm.NodesClosure.ancestor)
+            .where(orm.NodesClosure.descendant.in_(ids))
+            .where(orm.NodesClosure.ancestor != self.node.id)
+            .where(
+                orm.NodesClosure.ancestor.in_(
+                    select(orm.NodesClosure.descendant).where(
+                        orm.NodesClosure.ancestor == self.node.id
+                    )
+                )
+            )
+            .order_by(orm.NodesClosure.descendant, orm.NodesClosure.depth.desc())
+        )
+        async with self.context.session() as db:
+            rows = (await db.execute(statement)).all()
+        segments = collections.defaultdict(list)
+        for descendant, key, _depth in rows:
+            segments[descendant].append(key)
+        return {id_: "/".join(keys) for id_, keys in segments.items()}
 
     def sort(self, sorting):
         return self.new_variation(sorting=sorting)
@@ -1647,7 +1730,7 @@ class CatalogContainerAdapter(CatalogNodeAdapter):
             return [], None
 
         statement = select(orm.Node.key, orm.Node.id)
-        statement = statement.filter(orm.Node.parent == self.node.id)
+        statement = self._scope_statement(statement)
         statement = self._apply_cursor_pagination(statement, cursor, limit)
 
         async with self.context.session() as db:
@@ -1659,6 +1742,9 @@ class CatalogContainerAdapter(CatalogNodeAdapter):
             if self._is_default_sort:
                 next_cursor = rows[-1][1]
 
+        if self.recursive:
+            relative_keys = await self.relative_keys_for_ids([row[1] for row in rows])
+            return [relative_keys[row[1]] for row in rows], next_cursor
         return [row[0] for row in rows], next_cursor
 
     async def keys_range(self, offset: int = 0, limit: Optional[int] = None):
@@ -1676,8 +1762,8 @@ class CatalogContainerAdapter(CatalogNodeAdapter):
         if limit == 0:
             return []
 
-        statement = select(orm.Node.key)
-        statement = statement.filter(orm.Node.parent == self.node.id)
+        statement = select(orm.Node.key, orm.Node.id)
+        statement = self._scope_statement(statement)
         if offset:
             statement = statement.offset(offset)
         statement = self.apply_conditions(statement).order_by(*self.order_by_clauses)
@@ -1687,6 +1773,9 @@ class CatalogContainerAdapter(CatalogNodeAdapter):
         async with self.context.session() as db:
             rows = (await db.execute(statement)).all()
 
+        if self.recursive:
+            relative_keys = await self.relative_keys_for_ids([row[1] for row in rows])
+            return [relative_keys[row[1]] for row in rows]
         return [row[0] for row in rows]
 
     async def items_page(
@@ -1725,7 +1814,7 @@ class CatalogContainerAdapter(CatalogNodeAdapter):
         if limit == 0:
             return [], None
 
-        statement = select(orm.Node).filter(orm.Node.parent == self.node.id)
+        statement = self._scope_statement(select(orm.Node))
         statement = self._apply_cursor_pagination(statement, cursor, limit)
 
         async with self.context.session() as db:
@@ -1737,10 +1826,15 @@ class CatalogContainerAdapter(CatalogNodeAdapter):
             if self._is_default_sort:
                 next_cursor = nodes[-1].id
 
+        relative_keys = (
+            await self.relative_keys_for_ids([node.id for node in nodes])
+            if self.recursive
+            else {}
+        )
         return (
             [
                 (
-                    node.key,
+                    relative_keys[node.id] if self.recursive else node.key,
                     STRUCTURES[node.structure_family](self.context, node),
                 )
                 for node in nodes
@@ -1763,7 +1857,7 @@ class CatalogContainerAdapter(CatalogNodeAdapter):
         if limit == 0:
             return []
 
-        statement = select(orm.Node).filter(orm.Node.parent == self.node.id)
+        statement = self._scope_statement(select(orm.Node))
         if offset:
             statement = statement.offset(offset)
         statement = self.apply_conditions(statement).order_by(*self.order_by_clauses)
@@ -1773,8 +1867,16 @@ class CatalogContainerAdapter(CatalogNodeAdapter):
         async with self.context.session() as db:
             nodes = (await db.execute(statement)).scalars().all()
 
+        relative_keys = (
+            await self.relative_keys_for_ids([node.id for node in nodes])
+            if self.recursive
+            else {}
+        )
         return [
-            (node.key, STRUCTURES[node.structure_family](self.context, node))
+            (
+                relative_keys[node.id] if self.recursive else node.key,
+                STRUCTURES[node.structure_family](self.context, node),
+            )
             for node in nodes
         ]
 
@@ -1796,7 +1898,7 @@ class CatalogContainerAdapter(CatalogNodeAdapter):
             # so offset - 1 is the correct "previous item" cursor here.
             return offset - 1
 
-        statement = select(orm.Node.id).filter(orm.Node.parent == self.node.id)
+        statement = self._scope_statement(select(orm.Node.id))
         statement = self.apply_conditions(statement).order_by(*self.order_by_clauses)
         statement = statement.offset(offset - 1).limit(1)
 
