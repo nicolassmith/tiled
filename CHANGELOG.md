@@ -7,9 +7,10 @@ Write the date in place of the "Unreleased" in the case a new version is release
 
 ### Added
 
-- `Container.search_recursive(query, max_depth=None)` and the corresponding
+- `Container.search_recursive(*queries, max_depth=None)` and the corresponding
   `GET /api/v1/search-recursive/{path}` HTTP endpoint, which search all
-  descendants of a node (at any depth), not just direct children. Results are
+  descendants of a node (at any depth), not just direct children. Multiple
+  queries are combined with logical AND. Results are
   returned as a `RecursiveSearchResults` mapping keyed by path tuples relative
   to the search root. Supported by both the SQL catalog and `MapAdapter`,
   including `MapAdapter` trees with a catalog (or other container adapter)
